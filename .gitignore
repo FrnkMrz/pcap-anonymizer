@@ -29,3 +29,9 @@ build/
 # Project artifacts
 *_anon.pcap
 mapping.json
+
+
+# local PCAPs
+*.pcap
+*.pcapng
+
