@@ -42,6 +42,7 @@ MULTICAST_MAC_PREFIXES = ("01:00:5e", "33:33:")
 
 
 def is_reserved_mac(mac: str) -> bool:
+    """Return True if the MAC address should not be anonymized (broadcast, zero, or multicast)."""
     mac = mac.lower()
     if mac in RESERVED_MACS:
         return True
@@ -49,6 +50,7 @@ def is_reserved_mac(mac: str) -> bool:
 
 
 def is_reserved_ip(ip: str) -> bool:
+    """Return True if the IP address should not be anonymized (special/reserved/multicast)."""
     if ip in RESERVED_IPS:
         return True
     try:
@@ -61,6 +63,7 @@ def is_reserved_ip(ip: str) -> bool:
 class Anonymizer:
     @staticmethod
     def _next_unique(rng: random.Random, used: set[int], upper_bound: int) -> int:
+        """Draw a random integer in [1, upper_bound) that hasn't been used yet."""
         while True:
             value = rng.randrange(1, upper_bound)
             if value not in used:
@@ -69,6 +72,7 @@ class Anonymizer:
 
     @staticmethod
     def _parse_ip4_id(mapped: str):
+        """Extract the 24-bit numeric ID encoded in a mapped 10.x.y.z address, or None."""
         parts = mapped.split(".")
         if len(parts) != 4 or parts[0] != "10":
             return None
@@ -84,6 +88,7 @@ class Anonymizer:
 
     @staticmethod
     def _parse_ip6_id(mapped: str):
+        """Extract the numeric ID encoded in a mapped fd00::<hex> address, or None."""
         prefix = "fd00::"
         if not mapped.lower().startswith(prefix):
             return None
@@ -96,6 +101,7 @@ class Anonymizer:
 
     @staticmethod
     def _parse_mac_id(mapped: str):
+        """Extract the 24-bit numeric ID encoded in a mapped 02:00:00:xx:xx:xx MAC, or None."""
         parts = mapped.lower().split(":")
         if len(parts) != 6 or parts[:3] != ["02", "00", "00"]:
             return None
@@ -109,6 +115,7 @@ class Anonymizer:
 
     @staticmethod
     def _parse_dns_id(mapped: str):
+        """Extract the numeric ID encoded in a mapped host-<n>.anon.local name, or None."""
         prefix = "host-"
         suffix = ".anon.local"
         if not mapped.startswith(prefix) or not mapped.endswith(suffix):
@@ -120,17 +127,21 @@ class Anonymizer:
         return value if value > 0 else None
 
     def __init__(self, seed=None):
+        # Optional seed makes anonymization reproducible across runs
         self.rng = random.Random(seed)
+        # Ordered dicts preserve insertion order for deterministic JSON export
         self.ip4_map: OrderedDict[str, str] = OrderedDict()
         self.ip6_map: OrderedDict[str, str] = OrderedDict()
         self.mac_map: OrderedDict[str, str] = OrderedDict()
         self.dns_map: OrderedDict[str, str] = OrderedDict()
+        # Track already-assigned IDs to guarantee uniqueness of mapped values
         self._used_ip4_ids: set[int] = set()
         self._used_ip6_ids: set[int] = set()
         self._used_mac_ids: set[int] = set()
         self._used_dns_ids: set[int] = set()
 
     def map_ip4(self, addr: str) -> str:
+        """Return a consistent anonymized IPv4 address in the 10.0.0.0/8 range."""
         if is_reserved_ip(addr):
             return addr
         if addr not in self.ip4_map:
@@ -142,6 +153,7 @@ class Anonymizer:
         return self.ip4_map[addr]
 
     def map_ip6(self, addr: str) -> str:
+        """Return a consistent anonymized IPv6 address in the fd00::/8 ULA range."""
         if is_reserved_ip(addr):
             return addr
         key = addr.lower()
@@ -151,6 +163,7 @@ class Anonymizer:
         return self.ip6_map[key]
 
     def map_mac(self, addr: str) -> str:
+        """Return a consistent anonymized MAC address using the locally-administered 02:00:00: prefix."""
         key = addr.lower()
         if is_reserved_mac(key):
             return addr
@@ -163,6 +176,10 @@ class Anonymizer:
         return self.mac_map[key]
 
     def map_dns(self, name: str) -> str:
+        """Return a consistent anonymized DNS name of the form host-<n>.anon.local.
+
+        The trailing dot (FQDN indicator) is preserved when present.
+        """
         key = name.lower().rstrip(".")
         if not key:
             return name
@@ -170,11 +187,13 @@ class Anonymizer:
             n = self._next_unique(self.rng, self._used_dns_ids, 1 << 31)
             self.dns_map[key] = f"host-{n}.anon.local"
         mapped = self.dns_map[key]
+        # Preserve the trailing dot so FQDN-formatted names stay valid
         if name.endswith("."):
             mapped += "."
         return mapped
 
     def export_mapping(self) -> dict:
+        """Return the full address mapping as a plain dict suitable for JSON serialization."""
         return {
             "ipv4": dict(self.ip4_map),
             "ipv6": dict(self.ip6_map),
@@ -183,6 +202,11 @@ class Anonymizer:
         }
 
     def load_mapping(self, data: dict):
+        """Populate the anonymizer from a previously exported mapping dict.
+
+        Already-assigned IDs are re-registered so new addresses never collide
+        with values loaded from a prior run.
+        """
         if "ipv4" in data:
             self.ip4_map.update(data["ipv4"])
             for mapped in self.ip4_map.values():
@@ -260,6 +284,7 @@ def anonymize_packet(pkt, anon: Anonymizer, do_dns: bool = True):
 
 
 def _dns_name_to_str(name) -> str:
+    """Decode a DNS name field to a plain string regardless of whether scapy returned bytes or str."""
     if isinstance(name, bytes):
         return name.decode("utf-8", errors="replace")
     return str(name)
@@ -304,14 +329,15 @@ def _anonymize_dns_layer(pkt, anon: Anonymizer):
                 "ttl": rr.ttl,
             }
             rtype = rr.type
-            if rtype == 1:  # A
+            if rtype == 1:  # A record — anonymize the IPv4 address in rdata
                 kwargs["rdata"] = anon.map_ip4(rr.rdata)
-            elif rtype == 28:  # AAAA
+            elif rtype == 28:  # AAAA record — anonymize the IPv6 address in rdata
                 kwargs["rdata"] = anon.map_ip6(rr.rdata)
-            elif rtype in (5, 12, 2):  # CNAME, PTR, NS
+            elif rtype in (5, 12, 2):  # CNAME / PTR / NS — anonymize the target name
                 orig_rdata = _dns_name_to_str(rr.rdata)
                 kwargs["rdata"] = anon.map_dns(orig_rdata).encode()
             else:
+                # All other record types (MX, TXT, SOA, …) are left untouched
                 kwargs["rdata"] = rr.rdata
             new_rrs.append(DNSRR(**kwargs))
         setattr(dns, section, new_rrs)
